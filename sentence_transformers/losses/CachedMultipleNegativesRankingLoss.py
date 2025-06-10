@@ -67,6 +67,7 @@ class CachedMultipleNegativesRankingLoss(nn.Module):
         scale: float = 20.0,
         similarity_fct: callable[[Tensor, Tensor], Tensor] = util.cos_sim,
         mini_batch_size: int = 32,
+        mini_batch_num_tokens: int | None = None,
         show_progress_bar: bool = False,
     ) -> None:
         """
@@ -97,6 +98,8 @@ class CachedMultipleNegativesRankingLoss(nn.Module):
                 training and evaluation. The larger the mini-batch size, the more memory efficient the training is, but
                 the slower the training will be. It's recommended to set it as high as your GPU memory allows. The default
                 value is 32.
+            mini_batch_num_tokens: If set, the maximum number of tokens in a mini-batch. This is useful when the model
+                supports packed / unpadded batches. This overrides the `mini_batch_size` argument. The default is None.
             show_progress_bar: If True, a progress bar for the mini-batches is shown during training. The default is False.
 
         References:
@@ -159,6 +162,7 @@ class CachedMultipleNegativesRankingLoss(nn.Module):
         self.similarity_fct = similarity_fct
         self.cross_entropy_loss = nn.CrossEntropyLoss()
         self.mini_batch_size = mini_batch_size
+        self.mini_batch_num_tokens = mini_batch_num_tokens
         self.cache: list[list[Tensor]] | None = None
         self.random_states: list[list[RandContext]] | None = None
         self.show_progress_bar = show_progress_bar
@@ -192,25 +196,32 @@ class CachedMultipleNegativesRankingLoss(nn.Module):
         """Do forward pass on all the minibatches of the input features and yield corresponding embeddings."""
         input_ids: Tensor = sentence_feature["input_ids"]
         bsz, _ = input_ids.shape
-        for i, b in enumerate(
-            tqdm.trange(
-                0,
-                bsz,
-                self.mini_batch_size,
-                desc="Embed mini-batches",
-                disable=not self.show_progress_bar,
-            )
-        ):
-            e = b + self.mini_batch_size
-            reps, random_state = self.embed_minibatch(
-                sentence_feature=sentence_feature,
-                begin=b,
-                end=e,
-                with_grad=with_grad,
-                copy_random_state=copy_random_state,
-                random_state=None if random_states is None else random_states[i],
-            )
-            yield reps, random_state  # reps: (mbsz, hdim)
+        cummulative_num_tokens: Tensor = sentence_feature["attention_mask"].sum(axis=1).cumsum(axis=0)
+        b = 0
+        i = 0
+        with tqdm.tqdm(total=bsz, desc="Embed mini-batches", disable=not self.show_progress_bar) as pbar:
+            while b < bsz:
+                if self.mini_batch_num_tokens is not None:
+                    # cummulative_num_tokens[e-1] - cummulative_num_tokens[b-1] <= self.mini_batch_num_tokens
+                    # We find the last index e that satisfies this condition
+                    prev_cum_sum = cummulative_num_tokens[b - 1] if b > 0 else 0
+                    e = (
+                        torch.nonzero((cummulative_num_tokens - prev_cum_sum) <= self.mini_batch_num_tokens)[-1]
+                    ).item() + 1
+                else:
+                    e = min(b + self.mini_batch_size, bsz)
+                reps, random_state = self.embed_minibatch(
+                    sentence_feature=sentence_feature,
+                    begin=b,
+                    end=e,
+                    with_grad=with_grad,
+                    copy_random_state=copy_random_state,
+                    random_state=None if random_states is None else random_states[i],
+                )
+                pbar.update(e)
+                b = e
+                i += 1
+                yield reps, random_state  # reps: (mbsz, hdim)
 
     def calculate_loss_and_cache_gradients(self, reps: list[list[Tensor]]) -> Tensor:
         """Calculate the cross-entropy loss and cache the gradients wrt. the embeddings."""
@@ -252,7 +263,9 @@ class CachedMultipleNegativesRankingLoss(nn.Module):
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
         # Step (1): A quick embedding step without gradients/computation graphs to get all the embeddings
         reps = []
-        self.random_states = []  # Copy random states to guarantee exact reproduction of the embeddings during the second forward pass, i.e. step (3)
+        self.random_states = (
+            []
+        )  # Copy random states to guarantee exact reproduction of the embeddings during the second forward pass, i.e. step (3)
         for sentence_feature in sentence_features:
             reps_mbs = []
             random_state_mbs = []

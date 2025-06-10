@@ -44,6 +44,7 @@ class CachedMultipleNegativesSymmetricRankingLoss(nn.Module):
         scale: float = 20.0,
         similarity_fct: callable[[Tensor, Tensor], Tensor] = util.cos_sim,
         mini_batch_size: int = 32,
+        mini_batch_num_tokens: int | None = None,
         show_progress_bar: bool = False,
     ) -> None:
         """
@@ -70,6 +71,8 @@ class CachedMultipleNegativesSymmetricRankingLoss(nn.Module):
             mini_batch_size: Mini-batch size for the forward pass, this denotes how much memory is actually used during
                 training and evaluation. The larger the mini-batch size, the more memory efficient the training is, but
                 the slower the training will be.
+            mini_batch_num_tokens: If set, the maximum number of tokens in a mini-batch. This is useful when the model
+                supports packed / unpadded batches. This overrides the `mini_batch_size` argument. The default is None.
             show_progress_bar: If True, shows progress bar during processing
 
         Requirements:
@@ -127,6 +130,7 @@ class CachedMultipleNegativesSymmetricRankingLoss(nn.Module):
         self.similarity_fct = similarity_fct
         self.cross_entropy_loss = nn.CrossEntropyLoss()
         self.mini_batch_size = mini_batch_size
+        self.mini_batch_num_tokens = mini_batch_num_tokens
         self.cache: list[list[Tensor]] | None = None
         self.random_states: list[list[RandContext]] | None = None
         self.show_progress_bar = show_progress_bar
@@ -160,25 +164,32 @@ class CachedMultipleNegativesSymmetricRankingLoss(nn.Module):
         """Iterate over mini-batches of sentences for embedding."""
         input_ids: Tensor = sentence_feature["input_ids"]
         bsz, _ = input_ids.shape
-        for i, b in enumerate(
-            tqdm.trange(
-                0,
-                bsz,
-                self.mini_batch_size,
-                desc="Embed mini-batches",
-                disable=not self.show_progress_bar,
-            )
-        ):
-            e = b + self.mini_batch_size
-            reps, random_state = self.embed_minibatch(
-                sentence_feature=sentence_feature,
-                begin=b,
-                end=e,
-                with_grad=with_grad,
-                copy_random_state=copy_random_state,
-                random_state=None if random_states is None else random_states[i],
-            )
-            yield reps, random_state
+        cummulative_num_tokens: Tensor = sentence_feature["attention_mask"].sum(axis=1).cumsum(axis=0)
+        b = 0
+        i = 0
+        with tqdm.tqdm(total=bsz, desc="Embed mini-batches", disable=not self.show_progress_bar) as pbar:
+            while b < bsz:
+                if self.mini_batch_num_tokens is not None:
+                    # cummulative_num_tokens[e-1] - cummulative_num_tokens[b-1] <= self.mini_batch_num_tokens
+                    # We find the last index e that satisfies this condition
+                    prev_cum_sum = cummulative_num_tokens[b - 1] if b > 0 else 0
+                    e = (
+                        torch.nonzero((cummulative_num_tokens - prev_cum_sum) <= self.mini_batch_num_tokens)[-1]
+                    ).item() + 1
+                else:
+                    e = min(b + self.mini_batch_size, bsz)
+                reps, random_state = self.embed_minibatch(
+                    sentence_feature=sentence_feature,
+                    begin=b,
+                    end=e,
+                    with_grad=with_grad,
+                    copy_random_state=copy_random_state,
+                    random_state=None if random_states is None else random_states[i],
+                )
+                pbar.update(e)
+                b = e
+                i += 1
+                yield reps, random_state  # reps: (mbsz, hdim)
 
     def calculate_loss_and_cache_gradients(self, reps: list[list[Tensor]]) -> Tensor:
         """Calculate the symmetric loss and cache gradients."""

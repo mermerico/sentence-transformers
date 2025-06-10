@@ -113,20 +113,36 @@ def test_cmnrl_same_grad(
     loss_cmnrl_value.backward()
     grad = {name: p.grad.clone() for name, p in loss_cmnrl.named_parameters() if p.grad is not None}
 
+    # Run with cached and token_based mini-batch size
+    set_seed(42)
+    optimizer.zero_grad()
+    loss_cmnrl_t = losses.CachedMultipleNegativesRankingLoss(sbert, mini_batch_num_tokens=7)
+    loss_cmnrl_t_value = loss_cmnrl_t.forward(*sbert.smart_batching_collate(train_samples_cmnrl)) * scaler
+    loss_cmnrl_t_value.backward()
+    grad_t = {name: p.grad.clone() for name, p in loss_cmnrl_t.named_parameters() if p.grad is not None}
+
     # Then:
     if same_grad:
         assert pytest.approx(loss_mnrl_value.item()) == loss_cmnrl_value.item()
+        assert pytest.approx(loss_mnrl_value.item()) == loss_cmnrl_t_value.item()
     else:
         assert pytest.approx(loss_mnrl_value.item()) != loss_cmnrl_value.item()
+        assert pytest.approx(loss_mnrl_value.item()) != loss_cmnrl_t_value.item()
 
     nclose = 0
     for name in tqdm.tqdm(grad_expected):
         nclose += torch.allclose(grad[name], grad_expected[name], precision, precision)
 
+    nclose_t = 0
+    for name in tqdm.tqdm(grad_expected):
+        nclose_t += torch.allclose(grad_t[name], grad_expected[name], precision, precision)
+
     if same_grad:
         assert nclose == len(grad_expected)
+        assert nclose_t == len(grad_expected)
     else:
         assert nclose != len(grad_expected)
+        assert nclose_t != len(grad_expected)
 
 
 @pytest.mark.parametrize("use_rand_context", [True, False])
