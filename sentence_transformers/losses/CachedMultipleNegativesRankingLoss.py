@@ -208,6 +208,8 @@ class CachedMultipleNegativesRankingLoss(nn.Module):
                     e = (
                         torch.nonzero((cummulative_num_tokens - prev_cum_sum) <= self.mini_batch_num_tokens)[-1]
                     ).item() + 1
+                    if e == b:
+                        e += 1  # Ensure that we have at least one example in the mini-batch
                 else:
                     e = min(b + self.mini_batch_size, bsz)
                 reps, random_state = self.embed_minibatch(
