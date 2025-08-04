@@ -173,9 +173,13 @@ class CachedMultipleNegativesSymmetricRankingLoss(nn.Module):
                     # cummulative_num_tokens[e-1] - cummulative_num_tokens[b-1] <= self.mini_batch_num_tokens
                     # We find the last index e that satisfies this condition
                     prev_cum_sum = cummulative_num_tokens[b - 1] if b > 0 else 0
-                    e = (
-                        torch.nonzero((cummulative_num_tokens - prev_cum_sum) <= self.mini_batch_num_tokens)[-1]
-                    ).item() + 1
+                    fits_in_mini_batch = torch.nonzero(
+                        (cummulative_num_tokens - prev_cum_sum) <= self.mini_batch_num_tokens
+                    )
+                    if fits_in_mini_batch.numel() == 0:
+                        e = b + 1
+                    else:
+                        e = (fits_in_mini_batch[-1]).item() + 1
                     if e == b:
                         e += 1  # Ensure that we have at least one example in the mini-batch
                 else:
